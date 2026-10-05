@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+ds003061/
+data/
+*.fdt
+*.set
+*.fif
+.DS_Store
