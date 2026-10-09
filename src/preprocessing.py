@@ -1,38 +1,54 @@
+import warnings
+
 import mne
 from mne.preprocessing import ICA
 
-def preprocess_eeg(raw: mne.io.Raw, l_freq: float = 0.5, h_freq: float = 30.0) -> mne.io.Raw:
-    """
-    Cleans raw EEG signal:
-    1. Sets standard 10-20 montage.
-    2. Filters (bandpass + notch).
-    3. Re-references to average.
-    4. Removes ocular artifacts via ICA.
-    """
 
-    # Filtering and ICA require the signal to be loaded into memory.
+def preprocess_eeg(raw: mne.io.Raw, l_freq: float = 0.5, h_freq: float = 30.0) -> mne.io.Raw:
+    """Filter and average-reference EEG; remove EOG artifacts when identifiable."""
+
     if not raw.preload:
         raw.load_data()
 
-    # Set standard 10-20 montage
-    montage = mne.channels.make_standard_montage("standard_1020")
-    raw.set_montage(montage)
+    # Preserve channel positions loaded from the recording/BIDS metadata.
+    if raw.get_montage() is None:
+        montage = mne.channels.make_standard_montage("standard_1020")
+        raw.set_montage(montage, match_case=False)
 
-    # Filter the data (bandpass + notch)
-    raw.filter(l_freq=l_freq, h_freq=h_freq, fir_design='firwin', skip_by_annotation='edge')
-    raw.notch_filter(freqs=60.0)
+    raw.filter(
+        l_freq=l_freq, h_freq=h_freq, picks="eeg",
+        fir_design="firwin", skip_by_annotation=("edge", "bad_acq_skip"),
+    )
+    # Use acquisition metadata; ds003061 uses 50 Hz, not 60 Hz.
+    line_freq = raw.info.get("line_freq")
+    if line_freq and (h_freq is None or line_freq < h_freq):
+        raw.notch_filter(freqs=line_freq, picks="eeg")
 
-    # Re-reference to average
     raw.set_eeg_reference("average", projection=False)
 
-    # Remove ocular artifacts via ICA
-    n_eeg_channels = len(mne.pick_types(raw.info, eeg=True, exclude="bads"))
-    if n_eeg_channels < 2:
-        raise ValueError("At least two non-bad EEG channels are required for ICA.")
+    # Average referencing reduces the number of independent EEG signals.
+    rank = mne.compute_rank(raw).get("eeg", 0)
+    if rank < 2:
+        raise ValueError("At least two independent non-bad EEG signals are required for ICA.")
 
-    ica = ICA(n_components=min(15, n_eeg_channels), random_state=97)
-    ica.fit(raw)
-    ica.exclude = [0]  # Exclude the first component (ocular artifact)
-    raw = ica.apply(raw)
+    # Fit ICA on >=1 Hz data while retaining the requested ERP filter.
+    ica_raw = raw.copy()
+    if l_freq is None or l_freq < 1.0:
+        ica_raw.filter(l_freq=1.0, h_freq=None, picks="eeg")
+    ica = ICA(n_components=min(15, rank), random_state=97, max_iter="auto")
+    ica.fit(ica_raw, picks="eeg", reject_by_annotation=True)
+
+    # Component 0 is not necessarily an ocular artifact.
+    eog_picks = mne.pick_types(raw.info, eog=True, exclude="bads")
+    if len(eog_picks):
+        ica.exclude, _ = ica.find_bads_eog(ica_raw)
+        if ica.exclude:
+            raw = ica.apply(raw)
+    else:
+        warnings.warn(
+            "No EOG channels are marked: ICA components were not removed. "
+            "Review the components or identify a validated EOG channel first.",
+            RuntimeWarning,
+        )
 
     return raw
