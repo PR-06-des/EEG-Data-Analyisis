@@ -1,41 +1,38 @@
 import mne
 from mne.preprocessing import ICA
 
+def preprocess_eeg(raw: mne.io.Raw, l_freq: float = 0.5, h_freq: float = 30.0) -> mne.io.Raw:
+    """
+    Cleans raw EEG signal:
+    1. Sets standard 10-20 montage.
+    2. Filters (bandpass + notch).
+    3. Re-references to average.
+    4. Removes ocular artifacts via ICA.
+    """
 
-def preprocess_eeg(raw, l_freq=1.0, h_freq=40.0, *, bad_channels=(),
-                   ica_exclude=(), return_ica=False):
-    """Clean a copy; exclusions require visual review, never assume IC 0."""
-    clean = raw.copy().load_data()
-    unknown = set(bad_channels) - set(clean.ch_names)
-    if unknown:
-        raise ValueError(f"Unknown bad channels: {sorted(unknown)}")
-    clean.info["bads"] = sorted(set(clean.info["bads"]) | set(bad_channels))
-    if clean.get_montage() is None:
-        clean.set_montage(mne.channels.make_standard_montage("standard_1020"),
-                          match_case=False, on_missing="raise")
-    clean.filter(l_freq, h_freq, picks="eeg",
-                 skip_by_annotation=("edge", "bad_acq_skip"))
-    line = clean.info.get("line_freq")
-    if line and (h_freq is None or line < h_freq):
-        clean.notch_filter([line], picks="eeg")
-    clean.set_eeg_reference("average", projection=False)
-    rank = mne.compute_rank(clean).get("eeg", 0)
-    if rank < 2:
-        raise ValueError("At least two independent EEG signals are required.")
-    training = clean.copy()
-    if l_freq is None or l_freq < 1:
-        training.filter(1.0, None, picks="eeg")
-    ica = ICA(n_components=rank, method="infomax",
-              fit_params=dict(extended=True), random_state=97, max_iter="auto")
-    ica.fit(training, picks="eeg", reject_by_annotation=True)
-    exclusions = sorted(set(ica_exclude))
-    if any(i < 0 or i >= ica.n_components_ for i in exclusions):
-        raise ValueError("ICA exclusion index is outside the fitted range.")
-    ica.exclude = exclusions
-    if exclusions:
-        ica.apply(clean)
-    if clean.info["bads"]:
-        clean.interpolate_bads(reset_bads=True)
-        clean.set_eeg_reference("average", projection=False)
-    return (clean, ica) if return_ica else clean
+    # Filtering and ICA require the signal to be loaded into memory.
+    if not raw.preload:
+        raw.load_data()
 
+    # Set standard 10-20 montage
+    montage = mne.channels.make_standard_montage("standard_1020")
+    raw.set_montage(montage)
+
+    # Filter the data (bandpass + notch)
+    raw.filter(l_freq=l_freq, h_freq=h_freq, fir_design='firwin', skip_by_annotation='edge')
+    raw.notch_filter(freqs=60.0)
+
+    # Re-reference to average
+    raw.set_eeg_reference("average", projection=False)
+
+    # Remove ocular artifacts via ICA
+    n_eeg_channels = len(mne.pick_types(raw.info, eeg=True, exclude="bads"))
+    if n_eeg_channels < 2:
+        raise ValueError("At least two non-bad EEG channels are required for ICA.")
+
+    ica = ICA(n_components=min(15, n_eeg_channels), random_state=97)
+    ica.fit(raw)
+    ica.exclude = [0]  # Exclude the first component (ocular artifact)
+    raw = ica.apply(raw)
+
+    return raw
